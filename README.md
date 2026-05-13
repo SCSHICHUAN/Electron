@@ -61,7 +61,7 @@ npm run build
 
 - **Electron**: 见 `package.json` 中 `devDependencies`
 - **HTML / CSS / JavaScript**
-- **markdown-it**（`dependencies`）：在 preload 中将助手 Markdown 转为 HTML，供聊天气泡使用
+- **markdown-it**、**highlight.js**（`dependencies`）：Markdown 解析 + 代码围栏高亮（preload 内仅注册 **cpp**）
 
 ---
 
@@ -83,19 +83,20 @@ npm run build
 
 - **`volcArkBotsChatStream(messages, streamId)`**：`invoke` 启动流式请求（必须带 `streamId` 以便与事件关联）。
 - **`onVolcArkStreamEvent(callback)`**：订阅主进程推送的流事件，返回 **取消订阅函数**。
-- **`renderMarkdown(src)`**：使用 **markdown-it**（**`html: false`**、**`linkify: false`**、**`breaks: true`**）生成 HTML，降低模型输出中的 XSS 风险；**不在渲染进程 `require` 依赖**，便于与 `contextIsolation` 搭配。
+- **`renderMarkdown(src)`**：使用 **markdown-it**（**`html: false`**、**`linkify: false`**、**`breaks: true`**）生成 HTML；围栏代码由 **highlight.js** 着色——仅注册 **C++** 语法，**未标注或不受支持的语言一律按 C++ 规则高亮**。主题使用 **`github-dark.min.css`**（在 `app.html` 中相对路径链入）。**不在渲染进程 `require` 依赖**，便于与 `contextIsolation` 搭配。
 
 ### 渲染进程（`src/renderer/volc-chat.js` + `chat.js`）
 
 - **`volc-chat.js`**：生成 `streamId`，先注册 `onVolcArkStreamEvent`，再 `invoke`；可选 **`onDelta`** 回调；最终仍返回 **`{ content }` / `{ error }`**（与 `complete()` 兼容）。
 - **`chat.js`**：
-  - 流式阶段用 **`requestAnimationFrame` 节流**：同一帧内多次 `delta` 合并为一次 **`renderMarkdown(累积文本)`**，更新助手气泡 **`innerHTML`**，并加上 **`markdown-body`** 样式类，实现 **边下边排版**（标题、代码块、列表等实时跟进）。
+  - 流式阶段用 **`requestAnimationFrame` 节流**：同一帧内多次 `delta` 合并为一次 **`renderMarkdown(累积文本)`**，更新助手气泡 **`innerHTML`**，并加上 **`markdown-body`** 样式类，实现 **边下边排版**（标题、代码块、列表等实时跟进）。每次渲染后为每个 **`<pre>`** 外包 **`code-block-wrap`**，并加 **「复制」** 按钮（优先 **`navigator.clipboard.writeText`**，失败则 **`execCommand('copy')`**）；给 **`code`** 增加 **`hljs`** 类以匹配主题。
   - 流结束后 **`cancelAnimationFrame`**，避免最后一帧覆盖最终展示；再执行 **`command-handlers.js`** 的 **`handleAssistantContent`**（如 JSON 指令打开 QQ 音乐），最后用 **`setAssistantBubbleMarkdown`** 刷新为处理后的文案。
 - **用户消息**仍为纯文本 **`textContent`**，不对用户输入做 HTML 渲染。
 
-### 样式（`src/renderer/app.css`）
+### 样式（`src/renderer/app.css` + `app.html`）
 
-- **`.message-bubble.markdown-body`** 下对 `h1–h4`、`pre/code`、列表、`hr`、`blockquote`、`table`、`a` 等做了暗色主题适配，与聊天布局一致。
+- **`.message-bubble.markdown-body`** 下对 `h1–h4`、列表、`hr`、`blockquote`、`table`、`a` 等做了暗色主题适配。
+- **代码块**：`github-dark`（hljs）+ **`.code-block-wrap` / `.code-copy-btn`**（与 `pre` 内边距配合，避免文字与按钮重叠）。
 
 ### 共享常量（`src/shared/ipc-channels.js`）
 
@@ -104,7 +105,7 @@ npm run build
 
 ### 构建（`config/electron-builder.json`）
 
-- 打包 **`dependencies`**（含 **markdown-it** 及其传递依赖），preload 在成品应用中可正常 **`require('markdown-it')`**；请勿再排除整个 **`node_modules`**，否则流式与 Markdown 会在安装包内失效。
+- 打包 **`dependencies`**（含 **markdown-it**、**highlight.js** 等），preload 在成品应用中可正常 **`require('markdown-it')`** / **`require('highlight.js/...')`**；请勿再排除整个 **`node_modules`**，否则流式、Markdown 与高亮会在安装包内失效。
 
 ### 相关文件一览
 
@@ -116,6 +117,5 @@ npm run build
 | 暴露给页面的 API | `src/preload/preload.js` |
 | 通道名 | `src/shared/ipc-channels.js` |
 | 组装消息与订阅流 | `src/renderer/volc-chat.js` |
-| 气泡 UI、流式 Markdown 节流 | `src/renderer/chat.js` |
+| Markdown、代码高亮与复制按钮 | `src/preload/preload.js`、`src/renderer/chat.js`（`enhanceAssistantCodeBlocks`）、`src/renderer/app.css`、`src/renderer/app.html`（hljs 主题） |
 | 助手 JSON 指令 | `src/renderer/command-handlers.js` |
-| Markdown 气泡样式 | `src/renderer/app.css` |

@@ -1,5 +1,11 @@
 const { app, BrowserWindow, screen, ipcMain } = require('electron');
 const path = require('path');
+
+/* macOS 默认「覆盖型」滚动条，::webkit-scrollbar 常完全不生效；关闭后对话区自定义轨道才能显示 */
+if (process.platform === 'darwin') {
+  app.commandLine.appendSwitch('disable-features', 'OverlayScrollbar');
+}
+
 const { loadEnvFromSearchRoots, getDefaultSearchRoots } = require('./load-env');
 const qqMusicIpc = require('./ipc/qq-music');
 const arkChatIpc = require('./ipc/ark-chat');

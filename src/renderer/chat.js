@@ -11,16 +11,220 @@ let chatHistory = [{ role: 'assistant', content: INITIAL_GREETING }];
 if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScroll) {
   console.error('[renderer] chat.js: 缺少必要的 DOM 节点，请检查 app.html 结构');
 } else {
+  /** 一般「在底部附近」判定 */
+  const SCROLL_PIN_THRESHOLD_PX = 80;
+  /** 流式跟读：只有离底极近才自动滚 */
+  const STREAM_FOLLOW_MAX_GAP_PX = 20;
+  /** 用户 scroll 超过该 gap 视为在看历史 */
+  const STREAM_DETACH_SCROLL_GAP_PX = 40;
+  /** 向上滑轮后的冷却窗：禁止流式抢滚动 */
+  const WHEEL_UP_BLOCK_STREAM_MS = 900;
+
+  let chatProgrammaticScrollActive = false;
+  let chatUserDetachedFromStream = false;
+  let lastWheelUpIntentAt = 0;
+
+  function chatScrollGapFromBottom() {
+    const el = workspaceScroll;
+    return el.scrollHeight - el.scrollTop - el.clientHeight;
+  }
+
+  function isChatPinnedToBottom() {
+    return chatScrollGapFromBottom() <= SCROLL_PIN_THRESHOLD_PX;
+  }
+
+  function shouldStreamFollowBottom() {
+    if (chatUserDetachedFromStream) return false;
+    const now = performance.now();
+    if (lastWheelUpIntentAt > 0 && now - lastWheelUpIntentAt < WHEEL_UP_BLOCK_STREAM_MS) {
+      return false;
+    }
+    return chatScrollGapFromBottom() <= STREAM_FOLLOW_MAX_GAP_PX;
+  }
+
+  /** 本轮结束时的滚底：比流式略宽松，同样遵守滑轮冷却 */
+  function shouldAutoScrollAfterTurn() {
+    if (chatUserDetachedFromStream) return false;
+    const now = performance.now();
+    if (lastWheelUpIntentAt > 0 && now - lastWheelUpIntentAt < WHEEL_UP_BLOCK_STREAM_MS) {
+      return false;
+    }
+    return chatScrollGapFromBottom() <= SCROLL_PIN_THRESHOLD_PX;
+  }
+
+  function syncDetachFromStreamOnUserScroll() {
+    if (chatProgrammaticScrollActive) return;
+    const gap = chatScrollGapFromBottom();
+    if (gap > STREAM_DETACH_SCROLL_GAP_PX) {
+      chatUserDetachedFromStream = true;
+    } else if (gap <= 8) {
+      chatUserDetachedFromStream = false;
+    }
+  }
+
+  workspaceScroll.addEventListener('scroll', syncDetachFromStreamOnUserScroll, { passive: true });
+
+  function onChatWheelCapture(e) {
+    if (e.ctrlKey) return;
+    if (e.deltaY < 0) {
+      lastWheelUpIntentAt = performance.now();
+      chatUserDetachedFromStream = true;
+      return;
+    }
+    if (!chatProgrammaticScrollActive && e.deltaY > 0 && isChatPinnedToBottom()) {
+      chatUserDetachedFromStream = false;
+    }
+  }
+  workspaceScroll.addEventListener('wheel', onChatWheelCapture, { passive: true, capture: true });
+
+  let chatTouchLastY = null;
+  workspaceScroll.addEventListener('touchstart', (e) => {
+    if (e.touches.length === 1) chatTouchLastY = e.touches[0].clientY;
+  }, { passive: true });
+  workspaceScroll.addEventListener(
+    'touchmove',
+    (e) => {
+      if (e.touches.length !== 1) return;
+      const y = e.touches[0].clientY;
+      if (chatTouchLastY == null) return;
+      const dy = y - chatTouchLastY;
+      if (dy > 2) {
+        lastWheelUpIntentAt = performance.now();
+        chatUserDetachedFromStream = true;
+      }
+      if (!chatProgrammaticScrollActive && dy < -2 && isChatPinnedToBottom()) {
+        chatUserDetachedFromStream = false;
+      }
+      chatTouchLastY = y;
+    },
+    { passive: true }
+  );
+  workspaceScroll.addEventListener('touchend', () => {
+    chatTouchLastY = null;
+  }, { passive: true });
+
   /**
-   * 助手消息：Markdown → HTML + 样式类；无 API 时退回纯文本
-   * @param {HTMLDivElement} bubble
-   * @param {string} text
+   * @param {{ streamFollow?: boolean }} [opts] streamFollow=true 时瞬时滚底（流式跟读），避免 smooth 与用户滚轮打架
    */
+  function scrollChatToBottomForced(opts = {}) {
+    if (!workspaceScroll) return;
+    const el = workspaceScroll;
+    const streamFollow = opts.streamFollow === true;
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    const behavior = streamFollow || reduceMotion ? 'auto' : 'smooth';
+
+    chatProgrammaticScrollActive = true;
+    const top = Math.max(0, el.scrollHeight - el.clientHeight);
+    el.scrollTo({ top, behavior });
+
+    const release = () => {
+      chatProgrammaticScrollActive = false;
+    };
+    if (streamFollow || reduceMotion) {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(release);
+        });
+      });
+    } else {
+      setTimeout(release, 480);
+    }
+  }
+
+  /**
+   * 为每个 fenced `pre` 外包层：圆角背景层 + 横向滚动层 +「复制」按钮，并给 `code` 加上 hljs 类名
+   * @param {HTMLDivElement} bubble
+   */
+  function enhanceAssistantCodeBlocks(bubble) {
+    if (!bubble || typeof bubble.querySelectorAll !== 'function') return;
+    bubble.querySelectorAll('pre').forEach((pre) => {
+      if (pre.closest('.code-block-wrap')) return;
+      const code = pre.querySelector('code');
+      if (!code) return;
+      code.classList.add('hljs');
+
+      const wrap = document.createElement('div');
+      wrap.className = 'code-block-wrap';
+      const backdrop = document.createElement('div');
+      backdrop.className = 'code-block-backdrop';
+      backdrop.setAttribute('aria-hidden', 'true');
+      const scroll = document.createElement('div');
+      scroll.className = 'code-block-scroll';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'code-copy-btn';
+      btn.textContent = '复制';
+
+      const copyPlain = () => code.innerText;
+
+      btn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const text = copyPlain();
+        const okLabel = () => {
+          btn.textContent = '已复制';
+          clearTimeout(btn._copyTimer);
+          btn._copyTimer = setTimeout(() => {
+            btn.textContent = '复制';
+          }, 2000);
+        };
+        const failLabel = () => {
+          btn.textContent = '失败';
+          clearTimeout(btn._copyTimer);
+          btn._copyTimer = setTimeout(() => {
+            btn.textContent = '复制';
+          }, 2000);
+        };
+
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          navigator.clipboard.writeText(text).then(okLabel).catch(() => {
+            try {
+              const ta = document.createElement('textarea');
+              ta.value = text;
+              ta.setAttribute('readonly', '');
+              ta.style.position = 'fixed';
+              ta.style.left = '-9999px';
+              document.body.appendChild(ta);
+              ta.select();
+              document.execCommand('copy');
+              document.body.removeChild(ta);
+              okLabel();
+            } catch (_) {
+              failLabel();
+            }
+          });
+        } else {
+          try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.setAttribute('readonly', '');
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            okLabel();
+          } catch (_) {
+            failLabel();
+          }
+        }
+      });
+
+      pre.parentNode.insertBefore(wrap, pre);
+      wrap.appendChild(backdrop);
+      wrap.appendChild(btn);
+      wrap.appendChild(scroll);
+      scroll.appendChild(pre);
+    });
+  }
+
   function setAssistantBubbleMarkdown(bubble, text) {
     const api = window.electronAPI;
     bubble.classList.add('markdown-body');
     if (api && typeof api.renderMarkdown === 'function') {
       bubble.innerHTML = api.renderMarkdown(text);
+      enhanceAssistantCodeBlocks(bubble);
     } else {
       bubble.textContent = text;
     }
@@ -39,24 +243,26 @@ if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScro
     ctx.setRaf(
       requestAnimationFrame(() => {
         ctx.setRaf(0);
+        const follow = shouldStreamFollowBottom();
         const raw = ctx.getRaw();
         const { bubble } = ctx;
         const api = window.electronAPI;
         if (!raw) {
           clearAssistantMarkdownClass(bubble);
           bubble.textContent = '…';
-          scrollChatToBottom();
+          if (follow) scrollChatToBottomForced({ streamFollow: true });
           return;
         }
         bubble.classList.add('markdown-body');
         bubble.classList.add('streaming');
         if (api && typeof api.renderMarkdown === 'function') {
           bubble.innerHTML = api.renderMarkdown(raw);
+          enhanceAssistantCodeBlocks(bubble);
         } else {
           clearAssistantMarkdownClass(bubble);
           bubble.textContent = raw;
         }
-        scrollChatToBottom();
+        if (follow) scrollChatToBottomForced({ streamFollow: true });
       })
     );
   }
@@ -101,13 +307,16 @@ if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScro
     messageDiv.appendChild(avatar);
     messageDiv.appendChild(bubble);
     chatContent.insertBefore(messageDiv, scrollAnchor);
-    scrollChatToBottom();
+    scrollChatToBottomForced();
     return { messageDiv, bubble };
   }
 
   async function sendMessage() {
     const message = chatInput.value.trim();
     if (!message) return;
+
+    chatUserDetachedFromStream = false;
+    lastWheelUpIntentAt = 0;
 
     addMessage(message, 'user');
     const priorHistory = [...chatHistory];
@@ -149,11 +358,12 @@ if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScro
       bubble.classList.remove('streaming');
 
       if (result.error) {
+        const stickErr = shouldAutoScrollAfterTurn();
         const errText = `请求失败：${result.error}`;
         clearAssistantMarkdownClass(bubble);
         bubble.textContent = errText;
         chatHistory.push({ role: 'assistant', content: errText });
-        scrollChatToBottom();
+        if (stickErr) scrollChatToBottomForced({ streamFollow: true });
         return;
       }
 
@@ -163,34 +373,27 @@ if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScro
         const r = await window.botCommands.handleAssistantContent(reply);
         displayText = r.displayText;
       }
+      const stickEnd = shouldAutoScrollAfterTurn();
       setAssistantBubbleMarkdown(bubble, displayText);
       chatHistory.push({ role: 'assistant', content: displayText });
-      scrollChatToBottom();
+      if (stickEnd) scrollChatToBottomForced({ streamFollow: true });
     } catch (err) {
       cancelStreamMarkdownRender(streamRafRef);
       bubble.classList.remove('streaming');
+      const stickEx = shouldAutoScrollAfterTurn();
       clearAssistantMarkdownClass(bubble);
       const errText = `请求异常：${err.message || String(err)}`;
       bubble.textContent = errText;
       chatHistory.push({ role: 'assistant', content: errText });
-      scrollChatToBottom();
+      if (stickEx) scrollChatToBottomForced({ streamFollow: true });
     } finally {
       sendButton.disabled = false;
     }
   }
 
-  function scrollChatToBottom() {
-    if (!workspaceScroll) return;
-    const el = workspaceScroll;
-    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-    const run = () => {
-      const top = Math.max(0, el.scrollHeight - el.clientHeight);
-      el.scrollTo({ top, behavior: reduceMotion ? 'auto' : 'smooth' });
-    };
-    requestAnimationFrame(() => requestAnimationFrame(run));
-  }
-
   function addMessage(text, type) {
+    const stickAssistant = type === 'assistant' && shouldAutoScrollAfterTurn();
+
     const messageDiv = document.createElement('div');
     messageDiv.className = `message ${type}`;
 
@@ -215,6 +418,7 @@ if (!chatInput || !sendButton || !chatContent || !scrollAnchor || !workspaceScro
     }
 
     chatContent.insertBefore(messageDiv, scrollAnchor);
-    scrollChatToBottom();
+    if (type === 'user') scrollChatToBottomForced();
+    else if (stickAssistant) scrollChatToBottomForced();
   }
 }

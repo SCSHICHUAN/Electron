@@ -1,9 +1,24 @@
 const { contextBridge, ipcRenderer } = require('electron');
 const MarkdownIt = require('markdown-it');
+const hljs = require('highlight.js/lib/core');
+hljs.registerLanguage('cpp', require('highlight.js/lib/languages/cpp'));
 const { QQ_MUSIC, VOLC_ARK, VOLC_USER_CONFIG } = require('../shared/ipc-channels');
 
-/** html: false 禁止原文 HTML，降低模型输出 XSS 风险；不开启 linkify 避免危险 scheme */
+/** html: false 禁止原文 HTML；不开启 linkify；代码块用 highlight.js（仅注册 cpp，未知语言按 cpp 高亮） */
 const md = new MarkdownIt({ html: false, linkify: false, breaks: true });
+md.options.highlight = (str, lang) => {
+  const raw = (lang || '').trim().toLowerCase();
+  const useLang = raw && hljs.getLanguage(raw) ? raw : 'cpp';
+  try {
+    return hljs.highlight(str, { language: useLang, ignoreIllegals: true }).value;
+  } catch (_) {
+    try {
+      return hljs.highlight(str, { language: 'cpp', ignoreIllegals: true }).value;
+    } catch (__) {
+      return md.utils.escapeHtml(str);
+    }
+  }
+};
 
 try {
   contextBridge.exposeInMainWorld('electronAPI', {
@@ -30,7 +45,7 @@ try {
     },
     volcGetUserConfig: () => ipcRenderer.invoke(VOLC_USER_CONFIG.GET),
     volcSetUserConfig: (data) => ipcRenderer.invoke(VOLC_USER_CONFIG.SET, data),
-    /** 助手气泡 Markdown → HTML（仅主进程侧 require，渲染进程勿信任意 innerHTML） */
+    /** 助手气泡 Markdown → HTML（highlight.js 仅 cpp 语法集；样式见 app.html 引入的 github-dark） */
     renderMarkdown: (src) => md.render(String(src ?? '')),
   });
 } catch (error) {
